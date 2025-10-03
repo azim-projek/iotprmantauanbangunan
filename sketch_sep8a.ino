@@ -15,9 +15,6 @@
     - Early warning system for instability or collapse
 */
 
-// ESP32 + VL53L0X + Adafruit_MPU6050 + Telegram
-// Requirements: Adafruit_VL53L0X, Adafruit_MPU6050, UniversalTelegramBot
-// Fill WIFI_SSID, WIFI_PASS, BOT_TOKEN and CHAT_ID
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
 #include <MPU6050.h>
@@ -54,7 +51,7 @@ AlertLevel currentAlert = NORMAL;
 // Timer for periodic Telegram
 unsigned long lastTelegramTime = 0;
 const unsigned long TELEGRAM_INTERVAL = 60000; // 60 sec
-const unsigned long ALERT_COOLDOWN = 10000;    // 10 sec min between state change messages
+const unsigned long ALERT_COOLDOWN = 10000;    // 10 sec min between messages
 
 // === Baseline distance ===
 float baseline_cm = 0;
@@ -68,221 +65,168 @@ bool bufferFilled = false;
 // === Buzzer Pattern ===
 unsigned long buzzerTimer = 0;
 bool buzzerState = false;
-// === Extra Timer for buzzer delay ===
-unsigned long alertStartTime = 0;
-const unsigned long BUZZER_DELAY = 5000; // 5 sec
-
-
-void buzzerPattern(AlertLevel level) {
-  unsigned long now = millis();
-  int interval = 0;
-
-  if (level == WARNING) {
-    interval = 400;   // slower beep
-  } else if (level == CRITICAL) {
-    interval = 200;   // faster beep
-  } else {
-    digitalWrite(BUZZER_PIN, LOW);  // OFF in NORMAL
-    buzzerState = false;
-    return;
-  }
-
-  // Toggle buzzer ON/OFF
-  if (now - buzzerTimer >= interval) {
-    buzzerTimer = now;
-    buzzerState = !buzzerState;
-    digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
-  }
-}
 
 // === Helpers ===
+void buzzerPattern(AlertLevel level) {
+    unsigned long now = millis();
+    int interval = 0;
+
+    if (level == WARNING) interval = 400;
+    else if (level == CRITICAL) interval = 200;
+    else {
+        digitalWrite(BUZZER_PIN, LOW);
+        buzzerState = false;
+        return;
+    }
+
+    if (now - buzzerTimer >= interval) {
+        buzzerTimer = now;
+        buzzerState = !buzzerState;
+        digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+    }
+}
+
 void sendTelegram(String msg) {
-  Serial.println("📲 Sending Telegram...");
-  if (bot.sendMessage(CHAT_ID, msg, "")) {
-    Serial.println("✅ Sent to Telegram");
-  } else {
-    Serial.println("❌ Telegram failed");
-  }
+    Serial.println("📲 Sending Telegram...");
+    if (bot.sendMessage(CHAT_ID, msg, "")) Serial.println("✅ Sent");
+    else Serial.println("❌ Failed");
 }
 
 float getTiltDeg() {
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-  float axg = ax / 16384.0;
-  float ayg = ay / 16384.0;
-  float azg = az / 16384.0;
-  float roll = atan2(ayg, azg) * 57.2958;
-  float pitch = atan2(-axg, sqrt(ayg*ayg + azg*azg)) * 57.2958;
-  return max(abs(roll), abs(pitch));
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    float axg = ax / 16384.0;
+    float ayg = ay / 16384.0;
+    float azg = az / 16384.0;
+    float roll = atan2(ayg, azg) * 57.2958;
+    float pitch = atan2(-axg, sqrt(ayg*ayg + azg*azg)) * 57.2958;
+    return max(abs(roll), abs(pitch));
 }
 
 float movingAverage(float newValue) {
-  distanceBuffer[filterIndex] = newValue;
-  filterIndex = (filterIndex + 1) % FILTER_SIZE;
-  if (filterIndex == 0) bufferFilled = true;
+    distanceBuffer[filterIndex] = newValue;
+    filterIndex = (filterIndex + 1) % FILTER_SIZE;
+    if (filterIndex == 0) bufferFilled = true;
 
-  float sum = 0;
-  int count = bufferFilled ? FILTER_SIZE : filterIndex;
-  for (int i = 0; i < count; i++) sum += distanceBuffer[i];
-  return (count > 0) ? sum / count : newValue;
+    int count = bufferFilled ? FILTER_SIZE : filterIndex;
+    float sum = 0;
+    for (int i = 0; i < count; i++) sum += distanceBuffer[i];
+    return sum / count;
 }
 
 void ensureWiFi() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("🔄 Reconnecting WiFi...");
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-      delay(500);
-      Serial.print(".");
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("🔄 Reconnecting WiFi...");
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        unsigned long start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+            delay(500);
+            Serial.print(".");
+        }
+        if (WiFi.status() == WL_CONNECTED) Serial.println("\n✅ WiFi reconnected");
+        else Serial.println("\n❌ WiFi failed");
     }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\n✅ WiFi reconnected");
-    } else {
-      Serial.println("\n❌ WiFi reconnect failed");
-    }
-  }
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
+    Serial.begin(115200);
+    delay(1000);
+    Wire.begin(21, 22);
 
-  // I2C
-  Wire.begin(21, 22);
-
-  // VL53L0X Init
-  if (!lox.begin()) {
-    Serial.println("❌ VL53L0X not found");
-    while (1);
-  }
-  lox.setMeasurementTimingBudgetMicroSeconds(200000);
-
-  // MPU6050 Init
-  mpu.initialize();
-  if (mpu.testConnection()) {
-    Serial.println("✅ MPU6050 OK");
-  } else {
-    Serial.println("❌ MPU6050 not found");
-  }
-
-  // Buzzer
-  pinMode(BUZZER_PIN, OUTPUT);
-digitalWrite(BUZZER_PIN, LOW);
-
-
-  // WiFi
-  Serial.println("Connecting WiFi...");
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\n✅ WiFi connected");
-
-  client.setInsecure();
-
-  // Baseline distance (average of 10 readings)
-  float sum = 0;
-  int valid = 0;
-  for (int i = 0; i < 10; i++) {
-    VL53L0X_RangingMeasurementData_t measure;
-    lox.rangingTest(&measure, false);
-    if (measure.RangeStatus != 4) {
-      sum += measure.RangeMilliMeter / 10.0;
-      valid++;
+    // VL53L0X
+    if (!lox.begin()) {
+        Serial.println("❌ VL53L0X not found");
+        while (1);
     }
-    delay(100);
-  }
-  if (valid > 0) {
-    baseline_cm = sum / valid;
-  } else {
-    baseline_cm = 60.0; // fallback
-  }
+    lox.setMeasurementTimingBudgetMicroSeconds(200000);
 
-  Serial.print("📏 Baseline height set to: ");
-  Serial.print(baseline_cm);
-  Serial.println(" cm");
+    // MPU6050
+    mpu.initialize();
+    Serial.println(mpu.testConnection() ? "✅ MPU6050 OK" : "❌ MPU6050 not found");
 
-  sendTelegram("🏗️ Smart Building Monitor started ✅\n📏 Baseline: " + String(baseline_cm,1) + " cm");
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    // WiFi
+    Serial.println("Connecting WiFi...");
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\n✅ WiFi connected");
+    client.setInsecure();
+
+    // Baseline (average of 10 readings under 60 cm)
+    float sum = 0;
+    int valid = 0;
+    for (int i = 0; i < 10; i++) {
+        VL53L0X_RangingMeasurementData_t measure;
+        lox.rangingTest(&measure, false);
+        if (measure.RangeStatus != 4) {
+            float dist = measure.RangeMilliMeter / 10.0;
+            if (dist < 60.0) { // only count < 60 cm
+                sum += dist;
+                valid++;
+            }
+        }
+        delay(100);
+    }
+    baseline_cm = (valid > 0) ? sum / valid : 50.0;
+    Serial.print("📏 Baseline set to: "); Serial.println(baseline_cm);
+    sendTelegram("🏗️ Smart Building Monitor started ✅\n📏 Baseline: " + String(baseline_cm,1) + " cm");
 }
 
 void loop() {
-  ensureWiFi();
+    ensureWiFi();
 
-  // --- VL53L0X ---
-  VL53L0X_RangingMeasurementData_t measure;
-  lox.rangingTest(&measure, false);
-  float distance_cm = 0, delta = 0;
+    VL53L0X_RangingMeasurementData_t measure;
+    lox.rangingTest(&measure, false);
+    float distance_cm = -1;
+    float delta = 0;
 
-  if (measure.RangeStatus != 4) {
-    distance_cm = movingAverage(measure.RangeMilliMeter / 10.0);
-    delta = abs(distance_cm - baseline_cm);
-  } else {
-    distance_cm = -1;
-  }
+    if (measure.RangeStatus != 4) {
+        distance_cm = movingAverage(measure.RangeMilliMeter / 10.0);
+        delta = abs(distance_cm - baseline_cm);
+    }
 
-  // --- MPU6050 Tilt ---
-  float tilt = getTiltDeg();
+    float tilt = getTiltDeg();
 
-  // Print data
-  Serial.print("📏 Distance: ");
-  if (distance_cm > 0) Serial.print(distance_cm); else Serial.print("Out of range");
-  Serial.print(" cm | Δ: "); Serial.print(delta);
-  Serial.print(" cm | 📐 Tilt: "); Serial.print(tilt); Serial.println("°");
+    Serial.print("📏 Distance: ");
+    if (distance_cm > 0) Serial.print(distance_cm);
+    else Serial.print("Out of range");
+    Serial.print(" cm | Δ: "); Serial.print(delta);
+    Serial.print(" cm | 📐 Tilt: "); Serial.println(tilt);
 
-  // --- Alert Logic ---
-  AlertLevel newAlert = NORMAL;
+    // --- Alert Logic ---
+    AlertLevel newAlert = NORMAL;
+    if (delta > DIST_CRITICAL_CM || tilt > TILT_CRITICAL_DEG) newAlert = CRITICAL;
+    else if (delta > DIST_WARNING_CM || tilt > TILT_WARNING_DEG) newAlert = WARNING;
 
-  if (delta > DIST_CRITICAL_CM || tilt > TILT_CRITICAL_DEG) {
-    newAlert = CRITICAL;
-  } else if (delta > DIST_WARNING_CM || tilt > TILT_WARNING_DEG) {
-    newAlert = WARNING;
-  }
+    unsigned long now = millis();
+    static unsigned long lastAlertChange = 0;
 
-  unsigned long now = millis();
+    if (newAlert != currentAlert && (now - lastAlertChange > ALERT_COOLDOWN)) {
+        currentAlert = newAlert;
+        lastAlertChange = now;
+        lastTelegramTime = 0; // force immediate send
+    }
 
-  // Immediate Telegram if state changes (with cooldown)
-  static unsigned long lastAlertChange = 0;
-  if (newAlert != currentAlert && (now - lastAlertChange > ALERT_COOLDOWN)) {
-    currentAlert = newAlert;
-    lastAlertChange = now;
-    lastTelegramTime = 0; // force immediate send
-  }
+    // Telegram messages
+    if ((currentAlert == WARNING || currentAlert == CRITICAL) && (now - lastTelegramTime > TELEGRAM_INTERVAL)) {
+        lastTelegramTime = now;
+        String msg = (currentAlert == WARNING) ? "⚠️ WARNING!\n" : "🚨 CRITICAL!\n";
+        msg += "📏 Distance: " + String(distance_cm, 2) + " cm\n";
+        msg += "Δ from baseline: " + String(delta, 2) + " cm\n";
+        msg += "📐 Tilt: " + String(tilt, 2) + "°";
+        sendTelegram(msg);
+    }
 
-  // Periodic Telegram (every 1 min if abnormal)
- // Periodic Telegram (every 1 min if abnormal)
-if ((currentAlert == WARNING || currentAlert == CRITICAL) && (now - lastTelegramTime > TELEGRAM_INTERVAL)) {
-  lastTelegramTime = now;
+    if (currentAlert == NORMAL) {
+        noTone(BUZZER_PIN);
+        buzzerState = false;
+    }
 
-  String msg = (currentAlert == WARNING) ? "⚠️ WARNING!\n" : "🚨 CRITICAL!\n";
-  
-  if (distance_cm > 0) {
-    msg += "📏 Distance: " + String(distance_cm, 2) + " cm\n";
-    msg += "Δ from baseline: " + String(delta, 2) + " cm\n";
-  } else {
-    msg += "📏 Distance: Out of range\n";
-  }
-
-  msg += "📐 Tilt: " + String(tilt, 2) + "°";
-
-  sendTelegram(msg);
-}
-
-
-  // Notify when back to normal
- if (currentAlert == NORMAL) {
-  noTone(BUZZER_PIN);
-  buzzerState = false; // force reset
-}
-
-
-  // Handle buzzer pattern
-  buzzerPattern(currentAlert);
-
-  delay(200); // faster update, but smooth due to filtering
-}
-
-  // small delay; actual loop frequency controlled by STATUS_INTERVAL_MS for messages
-  delay(300);
+    buzzerPattern(currentAlert);
+    delay(200);
 }
